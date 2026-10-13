@@ -60,6 +60,14 @@ on:
         required: false
         type: boolean
         default: false
+      use_nomount:
+        required: false
+        type: boolean
+        default: false
+      use_networking:
+        required: false
+        type: boolean
+        default: false
       cve_2026_43499_patch:
         required: false
         type: boolean
@@ -92,7 +100,7 @@ on:
 jobs:
   build-kernel:
     name: "${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ inputs.ksu_variant }}"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     env:
@@ -117,6 +125,7 @@ jobs:
           echo "BBG 补丁      : ${{ inputs.use_bbg }}"
           echo "KPM 功能      : ${{ inputs.use_kpm }}"
           echo "Re-Kernel     : ${{ inputs.use_rekernel }}"
+          echo "网络增强      : ${{ inputs.use_networking }}"
           echo "CVE-2026-43499: ${{ inputs.cve_2026_43499_patch }}"
           echo "SUSFS 集成补丁导出: ${{ inputs.export_susfs_patches }}"
           echo "Droidspaces   : ${{ inputs.droidspaces }}"
@@ -294,58 +303,42 @@ jobs:
 
       - name: 克隆依赖仓库
         run: |
+          # 依赖克隆可能遇到瞬时网络错误；递增等待并随机错峰，避免矩阵任务同时重试。
+          # 每次克隆前清理目标目录，防止上次中断的残留使后续尝试必然失败。
+          clone_with_retry() {
+            local repository="$1" destination="$2"
+            shift 2
+            local attempt delay rc=1
+            for attempt in 1 2 3 4 5; do
+              echo "克隆 $repository（第 $attempt/5 次）..."
+              rm -rf -- "$destination" || return 1
+              if git clone "$repository" "$destination" "$@"; then
+                return 0
+              else
+                rc=$?
+              fi
+              if [ "$attempt" -lt 5 ]; then
+                delay=$((15 * (1 << (attempt - 1)) + RANDOM % 10))
+                echo "::warning::克隆 $repository 失败（退出码 $rc），${delay} 秒后重试"
+                sleep "$delay" || return 1
+              fi
+            done
+            rm -rf -- "$destination" || return 1
+            echo "克隆 $repository 失败，已用尽 5 次尝试（退出码 $rc）" >&2
+            return "$rc"
+          }
+
           ANYKERNEL_BRANCH="gki-2.0"
-          SUSFS_BRANCH="gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}"
 
           echo "克隆 AnyKernel3..."
-          git clone https://github.com/WildKernels/AnyKernel3.git -b "$ANYKERNEL_BRANCH"
+          clone_with_retry https://github.com/WildKernels/AnyKernel3.git AnyKernel3 -b "$ANYKERNEL_BRANCH"
           rm -rf AnyKernel3/.git
 
-          echo "克隆 SUSFS (分支: $SUSFS_BRANCH)..."
-          if [ -n "$LEGACY_SUKISU_CONFIG" ]; then
-            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
-          elif [ "${{ inputs.ksu_variant }}" == "SukiSU" ]; then
-            if ! git clone https://github.com/ShirkNeko/susfs4ksu.git -b "$SUSFS_BRANCH" 2>/dev/null; then
-              echo "ShirkNeko 仓库未找到分支 $SUSFS_BRANCH，回退到 simonpunk 原版..."
-              git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
-            fi
-          else
-            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
-          fi
-
-          if [ -n "$LEGACY_SUKISU_CONFIG" ]; then
-            SUSFS_FIXED_COMMIT=$(grep "^${SUSFS_BRANCH}=" "$LEGACY_SUKISU_CONFIG" | cut -d'=' -f2-)
-            if [ -z "$SUSFS_FIXED_COMMIT" ]; then
-              echo "未在 $LEGACY_SUKISU_CONFIG 配置 $SUSFS_BRANCH 的固定 SUSFS 提交" >&2
-              exit 1
-            fi
-            echo "${{ inputs.ksu_variant }} 固定 SUSFS 提交: $SUSFS_FIXED_COMMIT"
-            git -C susfs4ksu checkout "$SUSFS_FIXED_COMMIT"
-          fi
-
-          CONFIG_FILE="config/config"
-          if [ -z "$LEGACY_SUKISU_CONFIG" ] && [ -f "$CONFIG_FILE" ]; then
-            CUSTOM_ENABLED=$(grep "^custom=" "$CONFIG_FILE" | cut -d'=' -f2)
-            if [ "$CUSTOM_ENABLED" == "true" ]; then
-              CUSTOM_COMMIT=$(grep "^${SUSFS_BRANCH}=" "$CONFIG_FILE" | cut -d'=' -f2)
-              if [ -n "$CUSTOM_COMMIT" ]; then
-                echo "切换 SUSFS 到自定义提交: $CUSTOM_COMMIT"
-                cd susfs4ksu
-                git checkout "$CUSTOM_COMMIT"
-                cd ..
-              fi
-            fi
-          fi
-
-          SUSFS_LATEST_COMMIT_DATE=$(git -C susfs4ksu log -1 --date=format:'%Y-%m-%d %H:%M:%S %z' --format='%cd')
-          echo "SUSFS_LATEST_COMMIT_DATE=$SUSFS_LATEST_COMMIT_DATE" >> $GITHUB_ENV
-          echo "SUSFS 仓库最新提交日期: $SUSFS_LATEST_COMMIT_DATE"
-
           echo "准备补丁资源..."
-          git clone https://github.com/WildKernels/kernel_patches.git
-          git clone https://github.com/ShirkNeko/SukiSU_patch.git
+          clone_with_retry https://github.com/WildKernels/kernel_patches.git kernel_patches
+          clone_with_retry https://github.com/ShirkNeko/SukiSU_patch.git SukiSU_patch
           echo "使用当前仓库补丁目录: $ZZH_PATCHES"
-          git clone https://github.com/Numbersf/Action-Build.git --depth=1
+          clone_with_retry https://github.com/Numbersf/Action-Build.git Action-Build --depth=1
 
       - name: 初始化并同步内核源码
         working-directory: ${{ env.KERNEL_ROOT }}
@@ -546,7 +539,7 @@ jobs:
           variant_input="${{ inputs.ksu_variant }}"
 
           case "$variant_input" in
-            "Official"|"ReSukiSU")
+            "Official"|"BakaSU")
               BRANCH="-s main"
               ;;
             "SukiSU")
@@ -616,9 +609,9 @@ jobs:
               echo "添加 ${{ inputs.ksu_variant }}..."
               curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash $BRANCH
               ;;
-            "ReSukiSU")
-              echo "添加 ReSukiSU..."
-              curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash $BRANCH
+            "BakaSU")
+              echo "添加 BakaSU..."
+              curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash $BRANCH
               ;;
             *)
               if [ -z "$LEGACY_SUKISU_CONFIG" ]; then
@@ -690,11 +683,92 @@ jobs:
 
           echo "已更新 get_ksu_version_full 模板: $VERSION_TEMPLATE"
 
+      # 在内核源码和 KSU 准备完成后再获取 SUSFS，避免在前期集中拉取。
+      - name: 克隆 SUSFS 源码
+        if: inputs.enable_susfs
+        run: |
+          set -euo pipefail
+
+          # 最多尝试五次，两次尝试之间固定等待五秒。
+          retry() {
+            local attempt rc=1
+            for attempt in 1 2 3 4 5; do
+              echo "第 $attempt/5 次尝试: $*"
+              if "$@"; then
+                return 0
+              else
+                rc=$?
+              fi
+              if [ "$attempt" -lt 5 ]; then
+                echo "::warning::命令失败（退出码 $rc），5 秒后重试: $*"
+                sleep 5 || return 1
+              fi
+            done
+            echo "命令失败，已用尽 5 次尝试（退出码 $rc）: $*" >&2
+            return "$rc"
+          }
+
+          # 保留失败残留清理，防止重试被已有的半成品目录阻断。
+          clone_susfs() {
+            local rc
+            rm -rf -- susfs4ksu || return 1
+            if git clone "$1" -b "$SUSFS_BRANCH" susfs4ksu; then
+              return 0
+            else
+              rc=$?
+            fi
+            rm -rf -- susfs4ksu || return 1
+            return "$rc"
+          }
+
+          SUSFS_BRANCH="gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}"
+
+          echo "克隆 SUSFS (分支: $SUSFS_BRANCH)..."
+          if [ -n "$LEGACY_SUKISU_CONFIG" ]; then
+            retry clone_susfs https://gitlab.com/simonpunk/susfs4ksu.git
+          elif [ "${{ inputs.ksu_variant }}" == "SukiSU" ]; then
+            if ! retry clone_susfs https://github.com/ShirkNeko/susfs4ksu.git; then
+              echo "::warning::ShirkNeko 仓库克隆失败（分支 $SUSFS_BRANCH），回退到 simonpunk 原版..."
+              retry clone_susfs https://gitlab.com/simonpunk/susfs4ksu.git
+            fi
+          else
+            retry clone_susfs https://gitlab.com/simonpunk/susfs4ksu.git
+          fi
+
+          if [ -n "$LEGACY_SUKISU_CONFIG" ]; then
+            SUSFS_FIXED_COMMIT=$(grep "^${SUSFS_BRANCH}=" "$LEGACY_SUKISU_CONFIG" | cut -d'=' -f2- || true)
+            if [ -z "$SUSFS_FIXED_COMMIT" ]; then
+              echo "未在 $LEGACY_SUKISU_CONFIG 配置 $SUSFS_BRANCH 的固定 SUSFS 提交" >&2
+              exit 1
+            fi
+            echo "${{ inputs.ksu_variant }} 固定 SUSFS 提交: $SUSFS_FIXED_COMMIT"
+            retry git -C susfs4ksu checkout "$SUSFS_FIXED_COMMIT"
+          fi
+
+          CONFIG_FILE="config/config"
+          if [ -z "$LEGACY_SUKISU_CONFIG" ] && [ -f "$CONFIG_FILE" ]; then
+            CUSTOM_ENABLED=$(grep "^custom=" "$CONFIG_FILE" | cut -d'=' -f2 || true)
+            if [ "$CUSTOM_ENABLED" == "true" ]; then
+              CUSTOM_COMMIT=$(grep "^${SUSFS_BRANCH}=" "$CONFIG_FILE" | cut -d'=' -f2 || true)
+              if [ -n "$CUSTOM_COMMIT" ]; then
+                echo "切换 SUSFS 到自定义提交: $CUSTOM_COMMIT"
+                cd susfs4ksu
+                retry git checkout "$CUSTOM_COMMIT"
+                cd ..
+              fi
+            fi
+          fi
+
+          echo "SUSFS 实际提交: $(git -C susfs4ksu rev-parse HEAD)"
+          SUSFS_LATEST_COMMIT_DATE=$(git -C susfs4ksu log -1 --date=format:'%Y-%m-%d %H:%M:%S %z' --format='%cd')
+          echo "SUSFS_LATEST_COMMIT_DATE=$SUSFS_LATEST_COMMIT_DATE" >> "$GITHUB_ENV"
+          echo "SUSFS 仓库最新提交日期: $SUSFS_LATEST_COMMIT_DATE"
+
       # ==================== SUSFS 集成补丁导出 ====================
-      # 仅 SukiSU / ReSukiSU 且启用 SUSFS 时导出，快照用临时索引生成树对象，
+      # 仅 SukiSU / BakaSU 且启用 SUSFS 时导出，快照用临时索引生成树对象，
       # 不创建提交，避免改变「配置内核名称」读取的 HEAD 哈希
       - name: 记录 SUSFS 基线快照
-        if: inputs.export_susfs_patches && inputs.enable_susfs && inputs.ksu_mode != '禁用KSU' && (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'ReSukiSU')
+        if: inputs.export_susfs_patches && inputs.enable_susfs && inputs.ksu_mode != '禁用KSU' && (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'BakaSU')
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
           # 排除 .rej/.orig 和补丁文件本身：apply.sh 会把 SUSFS 补丁拷进 common/ 并留下 .rej
@@ -762,7 +836,11 @@ jobs:
             susfs_commit=$(git -C "$SUSFS4KSU" rev-parse HEAD)
 
             local rej_count patch_sha256
-            rej_count=$(find . -type f -name '*.rej' | wc -l)
+            # 上游自带且未改动的 .rej（如 android15-6.6-2026-04 的 mm/rmap.c.rej）不算冲突；
+            # patch 失败会覆盖同名文件，所以被改动过的仍要计入
+            rej_count=$(comm -23 \
+              <(find . -type f -name '*.rej' | sed 's|^\./||' | sort) \
+              <(git ls-files -- '*.rej' | while IFS= read -r f; do git diff --quiet -- "$f" && echo "$f"; done | sort) | wc -l)
             patch_sha256=$(sha256sum "$OUT_DIR/susfs.patch" | awk '{print $1}')
 
             jq -n \
@@ -804,6 +882,32 @@ jobs:
 
       - name: 备份基准 defconfig
         run: cp "$DEFCONFIG" "$DEFCONFIG.orig"
+
+      - name: 集成 NoMount 挂载元模块
+        if: inputs.use_nomount
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          # NoMount 是挂载元模块，在 fs/ 目录注册子系统，与 SUSFS sus_mount 不冲突，可与任意 KSU 变体共存。
+          # 必须在「生成 SUSFS 集成补丁」之后运行，避免 NoMount 改动被计入 susfs.patch；
+          # 且在「备份基准 defconfig」之后追加 CONFIG，确保 6.1+ 的 bazel fragment diff 能捕获 CONFIG_NOMOUNT。
+          set -euo pipefail
+          # 拉取 NoMount 内核集成脚本（dev 分支最新提交），脚本会克隆仓库、建立 fs/nomount 软链接并注册 Kconfig/Makefile（内部含幂等守卫）
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+            https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh | bash -s dev
+
+          if [ ! -L "fs/nomount" ]; then
+            echo "::error::NoMount 集成失败：fs/nomount 软链接缺失"
+            exit 1
+          fi
+          echo "NoMount 集成完成，commit: $(git -C NoMount rev-parse HEAD)"
+
+          # 启用 NoMount defconfig（幂等）
+          if ! grep -q '^CONFIG_NOMOUNT=y' "$DEFCONFIG"; then
+            echo "CONFIG_NOMOUNT=y" >> "$DEFCONFIG"
+            echo "已启用 CONFIG_NOMOUNT=y"
+          else
+            echo "CONFIG_NOMOUNT=y 已存在，跳过"
+          fi
 
       - name: 集成 Droidspaces 支持
         if: inputs.droidspaces != 'off'
@@ -856,7 +960,6 @@ jobs:
           fi
 
           echo "添加 Droidspaces 内核配置..."
-          # 按文档规则逐个处理: 已启用则跳过, "# not set" 则替换, 不存在则追加
           enable_config() {
             local cfg="$1"
             if grep -q "^${cfg}=y" "$DEFCONFIG"; then
@@ -972,7 +1075,6 @@ jobs:
 
           cd ..
 
-          # 配置路径
           CONFIG_PATH="./common/arch/arm64/configs/gki_defconfig"
           echo "正在检查并启用 CONFIG_NTSYNC..."
 
@@ -991,6 +1093,12 @@ jobs:
         if: inputs.enable_susfs
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
+          # 上游 2023-11、2024-01、2024-03 月度分支已带有 "unicode: Don't special case ignorable code points"，
+          # patch --forward 会判定为已应用并跳过，但被忽略的 hunk 仍会写成 .rej，先做幂等检查
+          if [ -f fs/unicode/mkutf8data.c ] && ! grep -q 'ignore_init' fs/unicode/mkutf8data.c; then
+            echo "源码已包含 Unicode 绕过修复，跳过补丁"
+            exit 0
+          fi
           if [ "${{ inputs.kernel_version }}" = "5.10" ] || [ "${{ inputs.kernel_version }}" = "5.15" ]; then
             patch -p1 --forward < "$ACTION_BUILD/patches/unicode_bypass_fix_6.1-.patch" || true
           else
@@ -1118,6 +1226,111 @@ jobs:
           echo "CONFIG_BBG=y" >> common/arch/arm64/configs/gki_defconfig
           sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
 
+      - name: 应用网络增强（BBRv3 / IPSet / Qdisc / CIFS）
+        if: inputs.use_networking
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          set -euo pipefail
+
+          BBR3_DIR="$KERNEL_PATCHES/common/bbrv3"
+          KVER="${{ inputs.kernel_version }}"
+          AVER="${{ inputs.android_version }}"
+
+          # ---------- BBRv3 补丁：按版本分派（来自 WildKernels/kernel_patches） ----------
+          case "$AVER-$KVER" in
+            android12-5.10) BBR3_PATCH="$BBR3_DIR/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch" ;;
+            android13-5.15) BBR3_PATCH="$BBR3_DIR/0001-net-tcp-backport-BBRv3-to-android13-5.15.patch" ;;
+            android14-6.1)  BBR3_PATCH="$BBR3_DIR/0001-net-tcp-backport-BBRv3-to-android14-6.1.patch" ;;
+            android15-6.6)  BBR3_PATCH="$BBR3_DIR/0001-net-tcp-backport-BBRv3-to-android15-6.6.patch" ;;
+            *) BBR3_PATCH="" ;;
+          esac
+
+          # android16-6.12 的 backport 补丁上游不可用（wild_kernel 已禁用），仅保留基线 BBR v1
+          if [ -n "$BBR3_PATCH" ]; then
+            if [ ! -f "$BBR3_PATCH" ]; then
+              echo "::error::BBRv3 补丁不存在: $BBR3_PATCH" >&2
+              exit 1
+            fi
+            if patch -p1 --dry-run < "$BBR3_PATCH" >/dev/null 2>&1; then
+              patch -p1 --no-backup-if-mismatch < "$BBR3_PATCH"
+              echo "[+] BBRv3 补丁已应用"
+            else
+              echo "::error::BBRv3 补丁应用失败，保留 .rej 供汇总产物分析" >&2
+              patch -p1 --no-backup-if-mismatch < "$BBR3_PATCH" || true
+              exit 1
+            fi
+          else
+            echo "[*] $AVER-$KVER 无 BBRv3 backport，跳过补丁"
+          fi
+
+          # 5.10 缺少 proc_dou8vec_minmax（BBRv3 依赖的 5.15+ sysctl API），补两个前置补丁
+          if [ "$KVER" = "5.10" ] && ! grep -qF 'int proc_dou8vec_minmax(' include/linux/sysctl.h 2>/dev/null; then
+            for prepatch in sysctl_add_proc_dou8vec_minmax sysctl_fix_data-races_in_proc_dou8vec_minmax; do
+              if patch -p1 --dry-run < "$BBR3_DIR/$prepatch.patch" >/dev/null 2>&1; then
+                patch -p1 --no-backup-if-mismatch < "$BBR3_DIR/$prepatch.patch"
+              else
+                echo "::error::5.10 sysctl 前置补丁应用失败: $prepatch" >&2
+                exit 1
+              fi
+            done
+            echo "[+] 5.10 sysctl 前置补丁已应用"
+          fi
+
+          set_config() {
+            local key="$1" value="$2"
+            if grep -q "^$key=" "$DEFCONFIG"; then
+              sed -i "s|^$key=.*|$key=$value|g" "$DEFCONFIG"
+            elif grep -q "^# $key is not set" "$DEFCONFIG"; then
+              sed -i "s|^# $key is not set|$key=$value|g" "$DEFCONFIG"
+            else
+              echo "$key=$value" >> "$DEFCONFIG"
+            fi
+          }
+
+          # IPSet 全家桶 + netfilter 联动（各版本 Kconfig 均已验证存在）
+          for cfg in IP_SET IP_SET_BITMAP_IP IP_SET_BITMAP_IPMAC IP_SET_BITMAP_PORT \
+            IP_SET_HASH_IP IP_SET_HASH_IPMARK IP_SET_HASH_IPPORT IP_SET_HASH_IPPORTIP \
+            IP_SET_HASH_IPPORTNET IP_SET_HASH_IPMAC IP_SET_HASH_MAC \
+            IP_SET_HASH_NETPORTNET IP_SET_HASH_NET IP_SET_HASH_NETNET \
+            IP_SET_HASH_NETPORT IP_SET_HASH_NETIFACE IP_SET_LIST_SET \
+            NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_SET NETFILTER_XT_TARGET_LOG \
+            NETFILTER_XT_MATCH_RECENT IP6_NF_NAT IP6_NF_TARGET_MASQUERADE; do
+            set_config "CONFIG_$cfg" y
+          done
+          set_config CONFIG_IP_SET_MAX 65534
+
+          # TCP 拥塞控制算法：已打 BBRv3 补丁的版本默认 bbr3，其余默认 bbr
+          for cfg in TCP_CONG_ADVANCED TCP_CONG_BBR TCP_CONG_CUBIC \
+            TCP_CONG_BIC TCP_CONG_WESTWOOD TCP_CONG_HTCP; do
+            set_config "CONFIG_$cfg" y
+          done
+          if [ -n "$BBR3_PATCH" ]; then
+            set_config CONFIG_TCP_CONG_BBR3 y
+            set_config CONFIG_DEFAULT_BBR3 y
+            set_config CONFIG_DEFAULT_TCP_CONG '"bbr3"'
+          else
+            set_config CONFIG_DEFAULT_BBR y
+            set_config CONFIG_DEFAULT_TCP_CONG '"bbr"'
+          fi
+
+          # 流量整形 Qdisc + 连接标记 + TTL/HopLimit + WireGuard
+          for cfg in NET_SCH_FQ NET_SCH_FQ_CODEL NET_SCH_CAKE NET_ACT_CONNMARK \
+            IP_NF_TARGET_TTL IP6_NF_TARGET_HL IP6_NF_MATCH_HL WIREGUARD; do
+            set_config "CONFIG_$cfg" y
+          done
+
+          # CIFS 网络文件系统（NETFS_SUPPORT 为隐藏符号，由 Kconfig 按需选中）
+          for cfg in CIFS NETWORK_FILESYSTEMS KEYS CIFS_XATTR CIFS_POSIX; do
+            set_config "CONFIG_$cfg" y
+          done
+
+          # 6.12 的 NETFS 内置化后需移除 modules.bzl 的模块条目，否则打包失败
+          if [ "$AVER" = "android16" ] && grep -q '"fs/netfs/netfs.ko",' modules.bzl 2>/dev/null; then
+            sed -i '/"fs\/netfs\/netfs\.ko",/d' modules.bzl
+          fi
+
+          echo "[+] 网络增强配置完成"
+
       - name: 应用 Re-Kernel
         if: inputs.use_rekernel
         working-directory: ${{ env.KERNEL_ROOT }}
@@ -1171,7 +1384,7 @@ jobs:
             echo "CONFIG_KSU=y" >> "$DEFCONFIG"
           fi
 
-          if [ "${{ inputs.ksu_mode }}" != "禁用KSU" ] && { [ "${{ inputs.ksu_variant }}" == "SukiSU" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40726)" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40548)" ] || [ "${{ inputs.ksu_variant }}" == "ReSukiSU" ] || [ "${{ inputs.ksu_variant }}" == "Next" ]; }; then
+          if [ "${{ inputs.ksu_mode }}" != "禁用KSU" ] && { [ "${{ inputs.ksu_variant }}" == "SukiSU" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40726)" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40548)" ] || [ "${{ inputs.ksu_variant }}" == "BakaSU" ] || [ "${{ inputs.ksu_variant }}" == "Next" ]; }; then
             if [[ "${{ inputs.use_kpm }}" == enabled* ]] || [[ "${{ inputs.use_kpm }}" == patched* ]]; then
               if ! grep -RqsE '^[[:space:]]*config[[:space:]]+KPM([[:space:]]|$)' common KernelSU 2>/dev/null; then
                 echo "错误: 已请求启用 KPM，但当前 KernelSU 代码未声明 CONFIG_KPM" >&2
@@ -1185,12 +1398,12 @@ jobs:
           if [[ ! "$CURRENT_SUB" =~ ^[0-9]+$ ]]; then
             CURRENT_SUB=99999
           fi
-          if [[ "${{ inputs.ksu_variant }}" == "ReSukiSU" && "${{ inputs.android_version }}" == "android13" && "${{ inputs.kernel_version }}" == "5.15" && "$CURRENT_SUB" -ge 74 && "$CURRENT_SUB" -le 137 ]]; then
+          if [[ "${{ inputs.ksu_variant }}" == "BakaSU" && "${{ inputs.android_version }}" == "android13" && "${{ inputs.kernel_version }}" == "5.15" && "$CURRENT_SUB" -ge 74 && "$CURRENT_SUB" -le 137 ]]; then
             {
               echo "CONFIG_KALLSYMS=y"
               echo "CONFIG_KALLSYMS_ALL=y"
             } >> "$DEFCONFIG"
-            # 修复 5.15.74~5.15.137: kallsyms_on_each_symbol 仅在 LIVEPATCH 下编译，导致 ReSukiSU 链接失败
+            # 修复 5.15.74~5.15.137: kallsyms_on_each_symbol 仅在 LIVEPATCH 下编译，导致 BakaSU 链接失败
             KALLSYMS_C="./common/kernel/kallsyms.c"
             if [ -f "$KALLSYMS_C" ] \
               && grep -qF 'int kallsyms_on_each_symbol' "$KALLSYMS_C" \
@@ -1339,7 +1552,7 @@ jobs:
               echo "编译尝试: $ATTEMPT"
               echo "开始时间: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
               echo "当前 KSU 最新提交日期: ${KSU_LATEST_COMMIT_DATE}"
-              echo "当前 SUSFS 最新提交日期: ${SUSFS_LATEST_COMMIT_DATE}"
+              echo "当前 SUSFS 最新提交日期: ${SUSFS_LATEST_COMMIT_DATE:-未启用}"
               set -ex
               cd "$KERNEL_ROOT"
 
@@ -1371,7 +1584,7 @@ jobs:
               fi
 
               echo "当前 KSU 最新提交日期: ${KSU_LATEST_COMMIT_DATE}"
-              echo "当前 SUSFS 最新提交日期: ${SUSFS_LATEST_COMMIT_DATE}"
+              echo "当前 SUSFS 最新提交日期: ${SUSFS_LATEST_COMMIT_DATE:-未启用}"
               echo "如果日期不同或相差过远则补丁失效、编译失败"
             } 2>&1 | tee "$LOG_FILE"
 
@@ -1420,8 +1633,8 @@ jobs:
           retention-days: 7
           compression-level: 9
 
-      # - name: 应用 KPM 补丁 (SukiSU/ReSukiSU/Next)
-      #   if: startsWith(inputs.use_kpm, 'patched') && (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'ReSukiSU' || inputs.ksu_variant == 'Next')
+      # - name: 应用 KPM 补丁 (SukiSU/BakaSU/Next)
+      #   if: startsWith(inputs.use_kpm, 'patched') && (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'BakaSU' || inputs.ksu_variant == 'Next')
       #   run: |
       #     case "${{ inputs.android_version }}" in
       #       "android12"|"android13")
@@ -1525,7 +1738,19 @@ jobs:
           REJECTS_DIR="$GITHUB_WORKSPACE/patch-rejects"
           mkdir -p "$REJECTS_DIR"
 
-          mapfile -t REJS < <(find "$KERNEL_ROOT" -type f -name '*.rej')
+          # 跳过上游自带的 .rej：上游分支可能自带已提交的 .rej
+          # （如 android15-6.6-2026-04 的 mm/rmap.c.rej），那不是本项目补丁的冲突；
+          # patch 失败会覆盖同名文件，所以只跳过「被 git 跟踪且未改动」的
+          mapfile -t REJS < <(
+            find "$KERNEL_ROOT" -type f -name '*.rej' | sort | while IFS= read -r rej; do
+              if git -C "$(dirname "$rej")" ls-files --error-unmatch -- "$(basename "$rej")" >/dev/null 2>&1 \
+                && git -C "$(dirname "$rej")" diff --quiet -- "$(basename "$rej")" 2>/dev/null; then
+                echo "跳过上游自带的 .rej: ${rej#"$KERNEL_ROOT"/}" >&2
+                continue
+              fi
+              echo "$rej"
+            done
+          )
           REJ_COUNT=${#REJS[@]}
           echo "发现 $REJ_COUNT 个 .rej 文件"
           echo "REJ_COUNT=$REJ_COUNT" >> $GITHUB_ENV
